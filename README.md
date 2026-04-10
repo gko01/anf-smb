@@ -8,6 +8,37 @@
 
 ---
 
+## Lab Setup
+
+All components are deployed in Azure within a single VNet:
+
+- **Windows 11 VM** (`10.10.10.9/24`) — client used to map and test the SMB volume; packet captures taken here
+- **Windows Server 2019 DC** (`10.10.10.8/24`) — Active Directory domain controller for `corp.azure`; packet captures taken here
+- **ANF SMB volume** (`10.10.1.10/24`) — Azure NetApp Files node hosting the `/smb1` SMB share; domain-joined as `ANF-AU-AA30`
+
+![Lab network topology](network-diagram.jpg)
+
+---
+
+## ANF Active Directory Connection Configuration
+
+The ANF AD connection was configured in the Azure portal with the following settings, which directly correspond to the Windows AD environment above:
+
+![ANF AD connection settings in the Azure portal](anf-ad-connection.jpg)
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Primary DNS | `10.10.10.8` | IP address of the Windows Server DC |
+| AD DNS Domain Name | `corp.azure` | Domain FQDN |
+| AD Site Name | `Default-First-Site-Name` | Must match the AD Sites and Services site name |
+| SMB Server (Computer Account) Prefix | `anf-au` | Prefix used to generate the machine account name (`ANF-AU-AA30`) |
+| Organizational Unit Path | `CN=Computers` | Default Computers container in AD |
+| LDAP Signing | Unchecked | Windows Server 2019 DC does not enforce LDAP signing by default |
+| LDAP over TLS | Unchecked | Plain LDAP port 389 used throughout the capture |
+| AES Encryption | Unchecked | RC4 accepted; enabling AES requires the DC to have AES keys for the account |
+
+---
+
 ## Introduction — Role of DNS, Kerberos, and LDAP
 
 Creating an ANF SMB volume is not a simple file-share operation. ANF must fully join the Active Directory domain as a first-class member — the same way a Windows Server would. Three protocols work together in sequence to make this happen.
