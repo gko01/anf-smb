@@ -96,6 +96,8 @@ LDAP is also subject to **channel binding and signing policies** on the DC. If t
 
 ## End-to-End Flow (Mermaid Sequence Diagram)
 
+![Wireshark packet capture of ANF SMB volume creation — taken on the domain controller](anf-smb-volume-creation-at-dc.jpg)
+
 ```mermaid
 sequenceDiagram
     participant ANF as ANF Node<br/>10.10.1.10
@@ -690,6 +692,8 @@ kerberos.msg_type == 30
 ---
 
 ### End-to-End Client Mount Flow (Mermaid Sequence Diagram)
+
+![Wireshark packet capture of Windows 11 client SMB mount and file access](windows11-smb-mount.jpg)
 
 ```mermaid
 sequenceDiagram
