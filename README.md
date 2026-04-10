@@ -10,10 +10,11 @@
 
 ## Introduction
 
-> **Disclaimer:** This is a personal experience-sharing write-up, not an official Microsoft or NetApp document. The observations, interpretations, and conclusions here are based on my own lab experiments and customer engagements — they may be incomplete, contain mistakes, or become inaccurate as ANF, Windows Server, and Active Directory evolve over time. Always refer to the [official Azure NetApp Files documentation](https://learn.microsoft.com/azure/azure-netapp-files/) for authoritative guidance before making production decisions.
+> **Disclaimer:** This is a personal experience-sharing write-up, not an official Microsoft or NetApp document. The observations, interpretations, and conclusions here are based on my own lab experiments and customer engagements experiences — they may be incomplete, contain mistakes, or become inaccurate as ANF, Windows Server, and Active Directory evolve over time. Always refer to the [official Azure NetApp Files documentation](https://learn.microsoft.com/azure/azure-netapp-files/) for authoritative guidance before making production decisions.
 
 ANF with SMB protocol is one of the most powerful ways to deliver enterprise file services in Azure — but it is also one of the most common sources of head-scratching support cases. Across customer engagements, the same pain points come up again and again:
 
+- Volume creation fails with a cryptic error like *"SASL bind to LDAP failed — PTR record missing"* even though forward DNS resolves correctly
 - The domain join appears to succeed but clients cannot authenticate to the share
 - Intermittent Kerberos errors that only surface in certain subnets or regions
 - NSG rules that silently break LDAP or KPASSWD while leaving DNS and SMB reachable
@@ -21,14 +22,64 @@ ANF with SMB protocol is one of the most powerful ways to deliver enterprise fil
 
 In most cases the root cause is not a product bug — it is that ANF performs a **full AD domain join**, the same way a Windows Server would. That means DNS, Kerberos, LDAP, SMB/IPC$, KPASSWD, and Netlogon all need to work correctly, in the right order, before a single SMB volume can be used.
 
-This write-up uses a **minimal Azure lab** and **Wireshark packet captures** to walk through every underlying protocol exchange involved in:
+### The Troubleshooter's Baseline Problem
 
-1. ANF creating an SMB volume and joining the Active Directory domain
-2. A Windows 11 client mounting the share and browsing its contents
+One of the hardest parts of diagnosing ANF SMB issues is not knowing what *normal* looks like. When something goes wrong, it is difficult to tell whether a particular error message, a "missing" packet type, or an unexpected protocol sequence is the cause of the problem — or just routine background behaviour that always happens.
 
-The goal is to go beyond *"check your NSG rules"* and show exactly which packet corresponds to which step — so that when something breaks, you can pinpoint it at the protocol level rather than guessing at configuration.
+This write-up addresses that directly. It uses a **minimal Azure lab** and **Wireshark packet captures** taken during a clean, successful run to document exactly what the normal protocol flow looks like — for both volume creation and client access. Every phase, every protocol, every expected "error" response (like `STATUS_OBJECT_NAME_NOT_FOUND` or `STATUS_INVALID_DEVICE_REQUEST`) is called out and explained so you know it is expected and harmless.
 
-**Who this is for:** Anyone curious about what actually happens under the hood when ANF talks to Active Directory — whether you are an Azure architect, a network engineer, a storage admin, or just someone who likes looking at Wireshark captures.
+The intended use is as a **reference baseline for troubleshooting**: when something breaks in your environment, compare your capture against the normal sequence here to find where it diverges.
+
+### What a Successful ANF SMB Setup Looks Like End-to-End
+
+A fully working setup involves two distinct flows, each with its own protocol sequence:
+
+**Flow 1 — ANF SMB Volume Creation (AD domain join)**
+
+When you create an ANF SMB volume, the ANF node performs the equivalent of a Windows domain join in the background. The following protocols must all succeed in order:
+
+| Step | Protocol | Port | What happens |
+|------|----------|------|--------------|
+| 1 | DNS | 53 | ANF resolves the domain and discovers the DC via SRV and A records |
+| 2 | LDAP | 389 | ANF reads the AD Root DSE anonymously to confirm domain info (×3) |
+| 3 | DNS | 53 | ANF queries site-scoped SRV records to find the closest DC |
+| 4 | Kerberos | 88 | ANF authenticates and obtains an LDAP service ticket |
+| 5 | LDAP | 389 | ANF binds with Kerberos (SASL/GSS-API) and searches for existing accounts |
+| 6 | LDAP | 389 | ANF creates the computer account (`CN=ANF-AU-AA30`) in AD |
+| 7 | SMB / IPC$ | 445 | ANF opens an IPC$ session and calls LSARPC to resolve domain SIDs |
+| 8 | KPASSWD | 464 | ANF sets the machine account password |
+| 9 | LDAP | 389 | ANF writes SPNs, `dnsHostName`, and `userAccountControl` to the account |
+| 10 | SMB / Netlogon | 445 | ANF establishes a Netlogon secure channel — the formal domain join |
+| 11 | Kerberos + SMB | 88 + 445 | ANF obtains a Kerberos identity for the SMB volume itself |
+| 12 | DNS | 53 | ANF begins periodic site-aware DC keepalive queries |
+
+If any one of these steps fails, volume creation fails — and the error message surfaced in the Azure portal often points to step 4 (Kerberos / PTR record) even when the real failure is at step 2 (LDAP channel binding) or step 8 (KPASSWD port blocked).
+
+**Flow 2 — Windows 11 Client Mount and File Access**
+
+Once the volume exists, a Windows client mounting the share goes through its own multi-step flow. Most of it is invisible to the user:
+
+| Step | Protocol | What happens |
+|------|----------|--------------|
+| A | DNS + Kerberos | Client resolves the ANF hostname and obtains a CIFS service ticket from the KDC |
+| B | SMB | Client negotiates dialect, sets up authenticated session, and connects to the share |
+| 1 | SMB | Explorer probes for `Desktop.ini` and `AutoRun.inf` — both return NOT_FOUND (normal) |
+| 2 | SMB | Explorer lists the share root — directory entries returned via `Find` |
+| 3 | SMB | Explorer queries share capacity for the status bar display |
+| 4 | SMB | User browses into a subfolder — Explorer registers a change notification watch, then cancels it on navigation |
+| 5 | SMB / IPC$ | Client connects to `IPC$`, checks for DFS (NOT_FOUND is expected), and calls `NetShareGetInfo` via SRVSVC |
+| 6 | SMB | Client issues `FSCTL_CREATE_OR_GET_OBJECT_ID` when opening files — ANF returns `STATUS_INVALID_DEVICE_REQUEST` (normal, NTFS Object IDs not supported) |
+
+Steps A and B are not visible in the capture because Windows reuses an already-established SMB session. The "errors" at steps 1, 5, and 6 are all expected and non-fatal — they are included here specifically because they appear alarming in a capture if you do not know to expect them.
+
+### How to Use This Write-Up
+
+1. **Read the overview diagrams** to understand the full sequence at a glance
+2. **Read the phase-by-phase explanations** when you need to understand what a specific protocol exchange is doing and why
+3. **When troubleshooting**, take a Wireshark capture at the DC during your failing volume creation (see the Troubleshooting Guide at the end), then compare each phase against the expected sequence documented here — the first phase that diverges is where to focus
+4. **When planning a new deployment**, use the protocol and subnet details here as a concrete reference for network address design, NSG rules, AD DS site naming, and subnet-to-site mapping — the lab setup shows exactly which subnets need to reach which ports on the DC, and Phase 3 shows why every ANF and workload subnet must be registered in AD Sites and Services for site-scoped DC discovery to work
+
+
 
 ---
 
@@ -684,145 +735,6 @@ Used in: Phase 3 (site-scoped SRV discovery)
 
 ---
 
-## Troubleshooting Guide
-
-### Step 1 — Verify DNS from Outside the ANF Subnet
-
-Deploy a test VM in an adjacent subnet (delegated subnets do not allow VM deployment) and run:
-
-```bash
-# Forward lookup
-dig gary-ad.corp.azure @10.10.10.8
-
-# Reverse lookup — this is what ANF checks for SPN construction
-dig -x 10.10.10.8 @10.10.10.8
-# ANSWER must be: 8.10.10.10.in-addr.arpa. PTR gary-ad.corp.azure.
-
-# Site SRV records — must return results for site-aware DC discovery
-dig SRV _kerberos._tcp.dc._msdcs.corp.azure @10.10.10.8
-dig SRV _ldap._tcp.Default-First-Site-Name._sites.dc._msdcs.corp.azure @10.10.10.8
-
-# IPv6 check — must return no address records
-nslookup -type=AAAA gary-ad.corp.azure 10.10.10.8
-```
-
----
-
-### Step 2 — Check for IPv6 AAAA Records on the DC
-
-```powershell
-# On DC — any AAAA record (including ::1) causes ANF to attempt IPv6 binding
-Resolve-DnsName "gary-ad.corp.azure" -Server 10.10.10.8
-# Must return ONLY the A record — no AAAA line
-
-# Remove any AAAA records
-Remove-DnsServerResourceRecord -ZoneName "corp.azure" -RRType AAAA -Name "gary-ad" -Force
-
-# Permanently disable IPv6 registration (requires reboot)
-Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" `
-    -Name "DisabledComponents" -Value 0xFF -Type DWord
-
-# Re-register DNS after removing AAAA records
-ipconfig /flushdns
-ipconfig /registerdns
-```
-
----
-
-### Step 3 — Check LDAP Channel Binding Policy on the DC
-
-```powershell
-# On DC
-Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" |
-    Select-Object LDAPServerIntegrity, LdapEnforceChannelBinding
-
-# LdapEnforceChannelBinding = 2 (Always) rejects ANF plain LDAP SASL bind
-# Windows Server 2025 defaults to 2 even without a registry key present
-# Fix:
-Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters" `
-    -Name "LdapEnforceChannelBinding" -Value 0 -Type DWord
-
-Restart-Service "Active Directory Domain Services" -Force
-```
-
----
-
-### Step 4 — Verify the AD Service Account
-
-```powershell
-# On DC — replace 'anfadmin' with the account used in the ANF AD connection
-Get-ADUser anfadmin -Properties PasswordExpired, LockedOut, Enabled, PasswordLastSet
-# Required: PasswordExpired=False, LockedOut=False, Enabled=True
-```
-
----
-
-### Step 5 — Verify NSG Rules
-
-Ports that must be open from `10.10.1.0/24` (ANF) to `10.10.10.0/24` (DC):
-
-```
-TCP/UDP 53   — DNS
-TCP     88   — Kerberos
-TCP     389  — LDAP
-TCP     445  — SMB
-TCP     464  — KPASSWD
-```
-
-Microsoft recommends **no NSG on the ANF delegated subnet** — outbound rules there can silently drop LDAP/Kerberos traffic.
-
----
-
-### Step 6 — Delete and Recreate the ANF AD Connection
-
-Required after **any** DNS, credential, or LDAP policy change. ANF does not retry a failed state automatically.
-
-```bash
-# Delete existing connection
-az netappfiles account ad remove \
-  --resource-group <rg> --account-name <netapp-account> \
-  --active-directory-id $(az netappfiles account show \
-    --resource-group <rg> --account-name <netapp-account> \
-    --query "activeDirectories[0].activeDirectoryId" -o tsv)
-
-# Wait 2 minutes, then recreate
-az netappfiles account ad add \
-  --resource-group <rg> \
-  --account-name <netapp-account> \
-  --username anfadmin \
-  --password '<password>' \
-  --domain corp.azure \
-  --dns 10.10.10.8 \
-  --smb-server-name anf \
-  --organizational-unit "CN=Computers,DC=corp,DC=azure"
-```
-
----
-
-### Step 7 — Packet Capture for Advanced Diagnosis
-
-```powershell
-# On DC — start capture before triggering ANF volume creation
-netsh trace start capture=yes IPv4.Address=10.10.10.8 tracefile=C:\anf-capture.etl maxsize=500
-# <trigger ANF SMB volume creation here>
-netsh trace stop
-
-# Convert to pcapng for Wireshark
-etl2pcapng.exe C:\anf-capture.etl C:\anf-capture.pcapng
-```
-
-**Key Wireshark display filters:**
-
-```
-# All traffic between ANF and DC
-ip.addr == 10.10.1.0/24 and ip.addr == 10.10.10.8
-
-# LDAP failures only
-ldap.resultCode != 0
-
-# Kerberos errors only
-kerberos.msg_type == 30
-```
 
 **Failure pattern reference:**
 
