@@ -8,6 +8,30 @@
 
 ---
 
+## Introduction
+
+> **Disclaimer:** This is a personal experience-sharing write-up, not an official Microsoft or NetApp document. The observations, interpretations, and conclusions here are based on my own lab experiments and customer engagements — they may be incomplete, contain mistakes, or become inaccurate as ANF, Windows Server, and Active Directory evolve over time. Always refer to the [official Azure NetApp Files documentation](https://learn.microsoft.com/azure/azure-netapp-files/) for authoritative guidance before making production decisions.
+
+ANF with SMB protocol is one of the most powerful ways to deliver enterprise file services in Azure — but it is also one of the most common sources of head-scratching support cases. Across customer engagements, the same pain points come up again and again:
+
+- The domain join appears to succeed but clients cannot authenticate to the share
+- Intermittent Kerberos errors that only surface in certain subnets or regions
+- NSG rules that silently break LDAP or KPASSWD while leaving DNS and SMB reachable
+- AD Sites and Services misconfiguration causing ANF to reach out to a DC in a different region
+
+In most cases the root cause is not a product bug — it is that ANF performs a **full AD domain join**, the same way a Windows Server would. That means DNS, Kerberos, LDAP, SMB/IPC$, KPASSWD, and Netlogon all need to work correctly, in the right order, before a single SMB volume can be used.
+
+This write-up uses a **minimal Azure lab** and **Wireshark packet captures** to walk through every underlying protocol exchange involved in:
+
+1. ANF creating an SMB volume and joining the Active Directory domain
+2. A Windows 11 client mounting the share and browsing its contents
+
+The goal is to go beyond *"check your NSG rules"* and show exactly which packet corresponds to which step — so that when something breaks, you can pinpoint it at the protocol level rather than guessing at configuration.
+
+**Who this is for:** Anyone curious about what actually happens under the hood when ANF talks to Active Directory — whether you are an Azure architect, a network engineer, a storage admin, or just someone who likes looking at Wireshark captures.
+
+---
+
 ## Lab Setup
 
 All components are deployed in Azure within a single VNet:
@@ -94,153 +118,88 @@ LDAP is also subject to **channel binding and signing policies** on the DC. If t
 
 ---
 
-## End-to-End Flow (Mermaid Sequence Diagram)
+## End-to-End Flow Overview
 
 ![Wireshark packet capture of ANF SMB volume creation — taken on the domain controller](anf-smb-volume-creation-at-dc.jpg)
+
+The 12 phases below show the sequence of protocol operations between the ANF node and the domain controller during SMB volume creation. Each phase is expanded with full packet detail in the [Phase-by-Phase Explanation](#phase-by-phase-explanation) section below.
 
 ```mermaid
 sequenceDiagram
     participant ANF as ANF Node<br/>10.10.1.10
-    participant DNS as DNS / DC<br/>10.10.10.8
-    participant KDC as Kerberos KDC<br/>10.10.10.8 :88
-    participant LDAP as LDAP / AD<br/>10.10.10.8 :389
-    participant SMB as SMB / DC<br/>10.10.10.8 :445
-    participant KPW as KPASSWD<br/>10.10.10.8 :464
+    participant DC as Domain Controller<br/>10.10.10.8
 
-    rect rgb(1, 27, 61)
-        Note over ANF,DNS: Phase 1 — Domain & DC Discovery
-        ANF->>DNS: A example.corp.azure?
-        DNS-->>ANF: NXDOMAIN (confirms DNS is authoritative)
-        ANF->>DNS: SRV _kerberos._tcp.dc._msdcs.CORP.AZURE?
-        DNS-->>ANF: gary-ad.corp.azure:88
-        ANF->>DNS: A gary-ad.corp.azure?
-        DNS-->>ANF: 10.10.10.8
+    rect rgb(194, 211, 233)
+        Note over ANF,DC: Phase 1 — Domain & DC Discovery (DNS :53)
+        ANF->>DC: DNS SRV / A queries
+        DC-->>ANF: DC hostname + IP
     end
 
-    rect rgb(66, 94, 74)
-        Note over ANF,LDAP: Phase 2 — Anonymous LDAP Root DSE Probe (×3)
-        ANF->>LDAP: bindRequest (anonymous simple)
-        LDAP-->>ANF: bindResponse: success
-        ANF->>LDAP: searchRequest "<ROOT>" baseObject
-        LDAP-->>ANF: searchResEntry [defaultNamingContext, supported features]
-        ANF->>LDAP: unbindRequest
-        Note over ANF,LDAP: Repeated on 2 more independent connections
+    rect rgb(181, 218, 192)
+        Note over ANF,DC: Phase 2 — Anonymous LDAP Root DSE Probe (LDAP :389)
+        ANF->>DC: Anonymous LDAP bind + Root DSE query ×3
+        DC-->>ANF: defaultNamingContext, domain info
     end
 
-    rect rgb(83, 76, 49)
-        Note over ANF,DNS: Phase 3 — AD Site-Aware DC Discovery
-        ANF->>DNS: SRV _ldap._tcp.Default-First-Site-Name._sites.dc._msdcs.CORP.AZURE?
-        DNS-->>ANF: gary-ad.corp.azure:389
-        ANF->>DNS: SRV _ldap._tcp.Default-First-Site-Name._sites.CORP.AZURE?
-        DNS-->>ANF: gary-ad.corp.azure:389
-        ANF->>DNS: SRV _kerberos._tcp.Default-First-Site-Name._sites.CORP.AZURE?
-        DNS-->>ANF: gary-ad.corp.azure:88
+    rect rgb(219, 205, 147)
+        Note over ANF,DC: Phase 3 — AD Site-Aware DC Discovery (DNS :53)
+        ANF->>DC: Site-scoped DNS SRV queries
+        DC-->>ANF: Site-local DC for LDAP + Kerberos
     end
 
-    rect rgb(94, 66, 61)
-        Note over ANF,KDC: Phase 4 — Kerberos Authentication (TGT + LDAP Service Ticket)
-        ANF->>KDC: AS-REQ (no pre-auth)
-        KDC-->>ANF: KRB5KDC_ERR_PREAUTH_REQUIRED (normal — DC requests proof)
-        ANF->>KDC: AS-REQ (with encrypted timestamp pre-auth)
-        KDC-->>ANF: AS-REP — TGT issued
-        ANF->>KDC: TGS-REQ (request ticket for ldap/gary-ad.corp.azure)
-        KDC-->>ANF: TGS-REP — LDAP service ticket issued
+    rect rgb(225, 171, 161)
+        Note over ANF,DC: Phase 4 — Kerberos Authentication (KDC :88)
+        ANF->>DC: AS-REQ → AS-REP (TGT) + TGS-REQ → TGS-REP
+        DC-->>ANF: LDAP service ticket issued
     end
 
-    rect rgb(94, 60, 139)
-        Note over ANF,LDAP: Phase 5 — Authenticated LDAP Bind (SASL/Kerberos)
-        ANF->>LDAP: bindRequest (SASL GSS-API + Kerberos service ticket)
-        LDAP-->>ANF: bindResponse: success
-        ANF->>LDAP: searchRequest "<ROOT>" baseObject
-        LDAP-->>ANF: searchResEntry [5 results — naming contexts]
-        ANF->>LDAP: searchRequest cn=Partitions,CN=Configuration,DC=corp,DC=azure
-        LDAP-->>ANF: searchResEntry CN=CORP partition info
-        ANF->>LDAP: searchRequest CN=Computers,dc=CORP,dc=AZURE (verify OU)
-        LDAP-->>ANF: searchResEntry CN=Computers [exists]
-        ANF->>LDAP: searchRequest dc=CORP,dc=AZURE wholeSubtree (check for existing account)
-        LDAP-->>ANF: searchResDone success [no pre-existing ANF account]
+    rect rgb(185, 158, 220)
+        Note over ANF,DC: Phase 5 — Authenticated LDAP Bind + AD Queries (LDAP :389)
+        ANF->>DC: SASL GSS-API bind + OU / partition discovery
+        DC-->>ANF: Naming contexts confirmed, no existing account
     end
 
-    rect rgb(25, 101, 85)
-        Note over ANF,LDAP: Phase 6 — Computer Account Creation
-        ANF->>LDAP: addRequest "cn=ANF-AU-AA30,CN=Computers,dc=CORP,dc=AZURE"
-        LDAP-->>ANF: addResponse: success
-        ANF->>LDAP: searchRequest (verify ANF-AU-AA30 exists)
-        LDAP-->>ANF: searchResEntry CN=ANF-AU-AA30 [confirmed]
+    rect rgb(157, 217, 204)
+        Note over ANF,DC: Phase 6 — Computer Account Creation (LDAP :389)
+        ANF->>DC: addRequest CN=ANF-AU-AA30
+        DC-->>ANF: addResponse: success
     end
 
-    rect rgb(100, 70, 20)
-        Note over ANF,SMB: Phase 7 — LSARPC Domain SID Lookup (via SMB2/IPC$)
-        ANF->>SMB: SMB2 Negotiate
-        SMB-->>ANF: Negotiate Response
-        ANF->>SMB: Session Setup Request (Kerberos ticket)
-        SMB-->>ANF: Session Setup Response
-        ANF->>SMB: Tree Connect \\gary-ad.corp.azure\ipc$
-        SMB-->>ANF: Tree Connect Response
-        ANF->>SMB: Create lsarpc + DCE/RPC Bind (LSARPC V0.0)
-        SMB-->>ANF: Bind_ack (Acceptance)
-        ANF->>SMB: lsa_OpenPolicy2 request
-        SMB-->>ANF: lsa_OpenPolicy2 response
-        ANF->>SMB: lsa_LookupSids2 request (×3 domain SIDs)
-        SMB-->>ANF: lsa_LookupSids2 responses (SIDs resolved)
+    rect rgb(213, 191, 152)
+        Note over ANF,DC: Phase 7 — LSARPC Domain SID Lookup (SMB :445 / IPC$)
+        ANF->>DC: SMB2 session + lsa_LookupSids2
+        DC-->>ANF: Domain SIDs resolved
     end
 
-    rect rgb(77, 53, 25)
-        Note over ANF,KPW: Phase 8 — KPASSWD — Set Machine Account Password
-        ANF->>KDC: TGS-REQ (request ticket for kadmin/changepw)
-        KDC-->>ANF: TGS-REP — KPASSWD service ticket
-        ANF->>KPW: KPASSWD Request (set machine account password)
-        KPW-->>ANF: KPASSWD Reply: success
+    rect rgb(218, 187, 151)
+        Note over ANF,DC: Phase 8 — Set Machine Account Password (KPASSWD :464)
+        ANF->>DC: KPASSWD request
+        DC-->>ANF: Password set: success
     end
 
-    rect rgb(29, 56, 95)
-        Note over ANF,LDAP: Phase 9 — Finalise Computer Account Attributes
-        ANF->>LDAP: searchRequest CN=ANF-AU-AA30 (get current attributes)
-        LDAP-->>ANF: searchResEntry CN=ANF-AU-AA30
-        ANF->>LDAP: modifyRequest CN=ANF-AU-AA30 (set SPNs, userAccountControl, dnsHostName)
-        LDAP-->>ANF: modifyResponse: success
-        ANF->>LDAP: unbindRequest (close authenticated session)
+    rect rgb(147, 175, 215)
+        Note over ANF,DC: Phase 9 — Finalise Computer Account Attributes (LDAP :389)
+        ANF->>DC: modifyRequest (SPNs, dnsHostName, userAccountControl)
+        DC-->>ANF: modifyResponse: success
     end
 
-    rect rgb(80, 20, 80)
-        Note over ANF,SMB: Phase 10 — Netlogon Secure Channel Establishment
-        ANF->>KDC: AS-REQ (no pre-auth) — machine account credential
-        KDC-->>ANF: KRB5KDC_ERR_PREAUTH_REQUIRED
-        ANF->>KDC: AS-REQ (with pre-auth)
-        KDC-->>ANF: AS-REP — machine account TGT
-        ANF->>KDC: TGS-REQ (ticket for cifs/GARY-AD)
-        KDC-->>ANF: TGS-REP — service ticket
-        ANF->>SMB: SMB2 Negotiate + Session Setup (machine identity)
-        SMB-->>ANF: Session Setup Response
-        ANF->>SMB: Tree Connect \\GARY-AD\ipc$ + Create NETLOGON
-        SMB-->>ANF: Create Response
-        ANF->>SMB: DCE/RPC Bind RPC_NETLOGON V1.0
-        SMB-->>ANF: Bind_ack (Acceptance)
-        ANF->>SMB: NetrServerReqChallenge (ANF-AU-AA30)
-        SMB-->>ANF: NetrServerReqChallenge response (server challenge)
-        ANF->>SMB: NetrServerAuthenticate2 (credential + flags)
-        SMB-->>ANF: NetrServerAuthenticate2 response — secure channel active
+    rect rgb(209, 143, 209)
+        Note over ANF,DC: Phase 10 — Netlogon Secure Channel (SMB :445 / NETLOGON)
+        ANF->>DC: NetrServerReqChallenge + NetrServerAuthenticate2
+        DC-->>ANF: Secure channel established
     end
 
-    rect rgb(24, 66, 24)
-        Note over ANF,KDC: Phase 11 — SMB Volume Kerberos Identity
-        ANF->>KDC: AS-REQ (no pre-auth) — volume identity
-        KDC-->>ANF: KRB5KDC_ERR_PREAUTH_REQUIRED (normal)
-        ANF->>KDC: AS-REQ (with pre-auth)
-        KDC-->>ANF: AS-REP — TGT for volume identity
-        ANF->>KDC: TGS-REQ (request SMB service ticket)
-        KDC-->>ANF: TGS-REP — SMB service ticket
-        ANF->>SMB: SMB2 Session Setup (volume identity)
-        SMB-->>ANF: SMB2 Session Setup Response
+    rect rgb(151, 222, 151)
+        Note over ANF,DC: Phase 11 — SMB Volume Kerberos Identity (KDC :88 + SMB :445)
+        ANF->>DC: AS-REQ / TGS-REQ for volume identity
+        DC-->>ANF: SMB service ticket issued
     end
 
-    rect rgb(66, 25, 25)
-        Note over ANF,DNS: Phase 12 — Ongoing Site-Aware DC Keepalive
+    rect rgb(212, 151, 151)
+        Note over ANF,DC: Phase 12 — Ongoing Site-Aware DC Keepalive (DNS :53)
         loop Per SMB node refresh
-            ANF->>DNS: SRV _ldap._tcp.Default-First-Site-Name._sites.CORP.AZURE?
-            DNS-->>ANF: gary-ad.corp.azure:389
-            ANF->>DNS: SRV _ldap._tcp.Default-First-Site-Name._sites.dc._msdcs.CORP.AZURE?
-            DNS-->>ANF: gary-ad.corp.azure:389
+            ANF->>DC: Site-scoped SRV queries
+            DC-->>ANF: Site-local DC refreshed
         end
     end
 ```
@@ -250,6 +209,22 @@ sequenceDiagram
 ## Phase-by-Phase Explanation
 
 ### Phase 1 — Domain & DC Discovery
+
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as DNS / DC<br/>10.10.10.8
+
+    rect rgb(194, 211, 233)
+        Note over ANF,DC: Phase 1 — Domain & DC Discovery (DNS :53)
+        ANF->>DC: A example.corp.azure?
+        DC-->>ANF: NXDOMAIN (confirms DNS is authoritative)
+        ANF->>DC: SRV _kerberos._tcp.dc._msdcs.CORP.AZURE?
+        DC-->>ANF: gary-ad.corp.azure:88
+        ANF->>DC: A gary-ad.corp.azure?
+        DC-->>ANF: 10.10.10.8
+    end
+```
 
 ANF validates DNS reachability and discovers the DC location.
 
@@ -266,6 +241,22 @@ SRV records return hostnames, not IPs. ANF resolves the SRV target with a follow
 
 ### Phase 2 — Anonymous LDAP Root DSE Probe
 
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as LDAP / DC<br/>10.10.10.8 :389
+
+    rect rgb(181, 218, 192)
+        Note over ANF,DC: Phase 2 — Anonymous LDAP Root DSE Probe (×3)
+        ANF->>DC: bindRequest (anonymous simple)
+        DC-->>ANF: bindResponse: success
+        ANF->>DC: searchRequest "<ROOT>" baseObject
+        DC-->>ANF: searchResEntry [defaultNamingContext, supported features]
+        ANF->>DC: unbindRequest
+        Note over ANF,DC: Repeated on 2 more independent connections
+    end
+```
+
 ANF opens a plain LDAP connection (port 389) with an **anonymous simple bind** to read the Root DSE — the DC's public capability advertisement. Three separate anonymous connections are made from different source ports (`19718`, `57030`, `55314`), each performing the same Root DSE query independently.
 
 - Retrieves: `defaultNamingContext` (`DC=corp,DC=azure`), supported LDAP versions, domain FQDN
@@ -278,6 +269,22 @@ ANF reads `defaultNamingContext` and confirms it matches the configured domain b
 ---
 
 ### Phase 3 — AD Site-Aware DC Discovery
+
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as DNS / DC<br/>10.10.10.8 :53
+
+    rect rgb(219, 205, 147)
+        Note over ANF,DC: Phase 3 — AD Site-Aware DC Discovery (DNS :53)
+        ANF->>DC: SRV _ldap._tcp.Default-First-Site-Name._sites.dc._msdcs.CORP.AZURE?
+        DC-->>ANF: gary-ad.corp.azure:389
+        ANF->>DC: SRV _ldap._tcp.Default-First-Site-Name._sites.CORP.AZURE?
+        DC-->>ANF: gary-ad.corp.azure:389
+        ANF->>DC: SRV _kerberos._tcp.Default-First-Site-Name._sites.CORP.AZURE?
+        DC-->>ANF: gary-ad.corp.azure:88
+    end
+```
 
 After confirming the domain, ANF queries for **site-scoped** SRV records using the AD site name `Default-First-Site-Name`:
 
@@ -305,6 +312,22 @@ These SRV records only exist when subnets are mapped to a site in **AD Sites and
 
 ### Phase 4 — Kerberos Authentication
 
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as KDC / DC<br/>10.10.10.8 :88
+
+    rect rgb(225, 171, 161)
+        Note over ANF,DC: Phase 4 — Kerberos Authentication (KDC :88)
+        ANF->>DC: AS-REQ (no pre-auth)
+        DC-->>ANF: KRB5KDC_ERR_PREAUTH_REQUIRED (normal)
+        ANF->>DC: AS-REQ (with encrypted timestamp pre-auth)
+        DC-->>ANF: AS-REP — TGT issued
+        ANF->>DC: TGS-REQ (ticket for ldap/gary-ad.corp.azure)
+        DC-->>ANF: TGS-REP — LDAP service ticket issued
+    end
+```
+
 ANF authenticates to the DC using Kerberos. No passwords are sent over the wire.
 
 | Frames | Exchange | Outcome |
@@ -327,6 +350,26 @@ Kerberos rejects tickets with a timestamp difference greater than **5 minutes** 
 
 ### Phase 5 — Authenticated LDAP Bind (SASL/Kerberos)
 
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as LDAP / DC<br/>10.10.10.8 :389
+
+    rect rgb(185, 158, 220)
+        Note over ANF,DC: Phase 5 — Authenticated LDAP Bind (SASL/Kerberos)
+        ANF->>DC: bindRequest (SASL GSS-API + Kerberos service ticket)
+        DC-->>ANF: bindResponse: success
+        ANF->>DC: searchRequest "<ROOT>" baseObject
+        DC-->>ANF: searchResEntry [naming contexts]
+        ANF->>DC: searchRequest cn=Partitions,CN=Configuration,DC=corp,DC=azure
+        DC-->>ANF: searchResEntry CN=CORP partition info
+        ANF->>DC: searchRequest CN=Computers,dc=CORP,dc=AZURE (verify OU)
+        DC-->>ANF: searchResEntry CN=Computers [exists]
+        ANF->>DC: searchRequest dc=CORP,dc=AZURE (check for existing account)
+        DC-->>ANF: searchResDone [no pre-existing ANF account]
+    end
+```
+
 ANF uses the LDAP service ticket from Phase 4 to perform a **SASL GSS-API bind** — a cryptographically authenticated LDAP session.
 
 | Frames | Exchange | Outcome |
@@ -344,6 +387,20 @@ All subsequent AD operations (account creation, modification) run over this auth
 
 ### Phase 6 — Computer Account Creation
 
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as LDAP / DC<br/>10.10.10.8 :389
+
+    rect rgb(157, 217, 204)
+        Note over ANF,DC: Phase 6 — Computer Account Creation (LDAP :389)
+        ANF->>DC: addRequest "cn=ANF-AU-AA30,CN=Computers,dc=CORP,dc=AZURE"
+        DC-->>ANF: addResponse: success
+        ANF->>DC: searchRequest (verify ANF-AU-AA30 exists)
+        DC-->>ANF: searchResEntry CN=ANF-AU-AA30 [confirmed]
+    end
+```
+
 ANF creates its own computer object in Active Directory using the authenticated LDAP session.
 
 | Frames | Operation | Outcome |
@@ -360,6 +417,28 @@ The ANF AD connection username performs the `addRequest`. If the account lacks t
 ---
 
 ### Phase 7 — LSARPC Domain SID Lookup (via SMB2/IPC$)
+
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as SMB / DC<br/>10.10.10.8 :445
+
+    rect rgb(213, 191, 152)
+        Note over ANF,DC: Phase 7 — LSARPC Domain SID Lookup (SMB :445 / IPC$)
+        ANF->>DC: SMB2 Negotiate
+        DC-->>ANF: Negotiate Response
+        ANF->>DC: Session Setup Request (Kerberos ticket)
+        DC-->>ANF: Session Setup Response
+        ANF->>DC: Tree Connect \\gary-ad.corp.azure\ipc$
+        DC-->>ANF: Tree Connect Response
+        ANF->>DC: Create lsarpc + DCE/RPC Bind (LSARPC V0.0)
+        DC-->>ANF: Bind_ack (Acceptance)
+        ANF->>DC: lsa_OpenPolicy2 request
+        DC-->>ANF: lsa_OpenPolicy2 response
+        ANF->>DC: lsa_LookupSids2 request (×3 domain SIDs)
+        DC-->>ANF: lsa_LookupSids2 responses (SIDs resolved)
+    end
+```
 
 Immediately after the computer account is created in LDAP, ANF opens a new SMB2 session to the DC's `IPC$` share and binds the **LSARPC** (Local Security Authority RPC) pipe to resolve domain Security Identifiers (SIDs).
 
@@ -387,6 +466,20 @@ LSARPC has no dedicated port — it is multiplexed through SMB2/IPC$ on TCP 445.
 
 ### Phase 8 — KPASSWD — Set Machine Account Password
 
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as KDC / KPASSWD<br/>10.10.10.8 :88 / :464
+
+    rect rgb(218, 187, 151)
+        Note over ANF,DC: Phase 8 — Set Machine Account Password (KPASSWD :464)
+        ANF->>DC: TGS-REQ (ticket for kadmin/changepw) :88
+        DC-->>ANF: TGS-REP — KPASSWD service ticket
+        ANF->>DC: KPASSWD Request (set machine account password) :464
+        DC-->>ANF: KPASSWD Reply: success
+    end
+```
+
 With the computer account created and domain SIDs resolved, ANF sets the machine account password using the **Kerberos Password Change (KPASSWD)** protocol.
 
 | Frames | Protocol | Port | Exchange |
@@ -400,6 +493,21 @@ KPASSWD is a distinct protocol (RFC 3244) on TCP/UDP 464. If the ANF delegated s
 ---
 
 ### Phase 9 — Finalise Computer Account Attributes
+
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as LDAP / DC<br/>10.10.10.8 :389
+
+    rect rgb(147, 175, 215)
+        Note over ANF,DC: Phase 9 — Finalise Computer Account Attributes (LDAP :389)
+        ANF->>DC: searchRequest CN=ANF-AU-AA30 (get current attributes)
+        DC-->>ANF: searchResEntry CN=ANF-AU-AA30
+        ANF->>DC: modifyRequest CN=ANF-AU-AA30 (SPNs, userAccountControl, dnsHostName)
+        DC-->>ANF: modifyResponse: success
+        ANF->>DC: unbindRequest (close authenticated session)
+    end
+```
 
 After the password is set, ANF writes the remaining attributes to the computer account over the still-open authenticated LDAP session.
 
@@ -417,6 +525,27 @@ Attributes written include:
 ---
 
 ### Phase 10 — Netlogon Secure Channel Establishment
+
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as KDC + SMB / DC<br/>10.10.10.8
+
+    rect rgb(209, 143, 209)
+        Note over ANF,DC: Phase 10 — Netlogon Secure Channel (KDC :88 + SMB :445)
+        ANF->>DC: AS-REQ → AS-REP (machine account TGT) :88
+        ANF->>DC: TGS-REQ → TGS-REP (ticket for cifs/GARY-AD) :88
+        ANF->>DC: SMB2 Negotiate + Session Setup (machine identity) :445
+        DC-->>ANF: Session Setup Response
+        ANF->>DC: Tree Connect \\GARY-AD\ipc$ + Create NETLOGON
+        ANF->>DC: DCE/RPC Bind RPC_NETLOGON V1.0
+        DC-->>ANF: Bind_ack (Acceptance)
+        ANF->>DC: NetrServerReqChallenge (ANF-AU-AA30)
+        DC-->>ANF: NetrServerReqChallenge response (server challenge)
+        ANF->>DC: NetrServerAuthenticate2 (credential + flags)
+        DC-->>ANF: NetrServerAuthenticate2 — secure channel established
+    end
+```
 
 After the computer account is fully provisioned, ANF establishes a **Netlogon Secure Channel** — the challenge-response handshake that formally admits the ANF node as a trusted domain member.
 
@@ -443,6 +572,24 @@ If the Netlogon secure channel fails (e.g., password mismatch, name collision wi
 
 ### Phase 11 — SMB Volume Kerberos Identity
 
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as KDC + SMB / DC<br/>10.10.10.8
+
+    rect rgb(151, 222, 151)
+        Note over ANF,DC: Phase 11 — SMB Volume Kerberos Identity (KDC :88 + SMB :445)
+        ANF->>DC: AS-REQ (no pre-auth) — volume identity :88
+        DC-->>ANF: KRB5KDC_ERR_PREAUTH_REQUIRED (normal)
+        ANF->>DC: AS-REQ (with pre-auth)
+        DC-->>ANF: AS-REP — TGT for volume identity
+        ANF->>DC: TGS-REQ (SMB service ticket)
+        DC-->>ANF: TGS-REP — SMB service ticket issued
+        ANF->>DC: SMB2 Session Setup (volume identity) :445
+        DC-->>ANF: SMB2 Session Setup Response
+    end
+```
+
 ANF obtains an independent Kerberos identity for the SMB volume itself. This identity is what clients authenticate against when they mount the share.
 
 - Multiple rounds of: AS-REQ → PREAUTH error → AS-REQ (with pre-auth) → AS-REP (TGT)
@@ -454,6 +601,22 @@ ANF obtains an independent Kerberos identity for the SMB volume itself. This ide
 ---
 
 ### Phase 12 — Ongoing Site-Aware DC Keepalive
+
+```mermaid
+sequenceDiagram
+    participant ANF as ANF Node<br/>10.10.1.10
+    participant DC as DNS / DC<br/>10.10.10.8 :53
+
+    rect rgb(212, 151, 151)
+        Note over ANF,DC: Phase 12 — Ongoing Site-Aware DC Keepalive (DNS :53)
+        loop Per SMB node refresh
+            ANF->>DC: SRV _ldap._tcp.Default-First-Site-Name._sites.CORP.AZURE?
+            DC-->>ANF: gary-ad.corp.azure:389
+            ANF->>DC: SRV _ldap._tcp.Default-First-Site-Name._sites.dc._msdcs.CORP.AZURE?
+            DC-->>ANF: gary-ad.corp.azure:389
+        end
+    end
+```
 
 After the volume is provisioned, each ANF SMB node continues refreshing site-local LDAP and Kerberos SRV records in parallel. The repeated DNS SRV queries, multiple SMB2 Negotiate sessions, and multiple Kerberos AS-REQ/TGS-REQ cycles at frames 13194+ are normal keepalive behaviour — **not errors**.
 
@@ -691,9 +854,11 @@ kerberos.msg_type == 30
 
 ---
 
-### End-to-End Client Mount Flow (Mermaid Sequence Diagram)
+### End-to-End Client Mount Flow Overview
 
 ![Wireshark packet capture of Windows 11 client SMB mount and file access](windows11-smb-mount.jpg)
+
+The 8 phases below (2 pre-capture + 6 captured) cover the full Windows 11 client SMB mount flow. Each phase is expanded with full packet detail in the [Phase-by-Phase Explanation (Client Mount)](#phase-by-phase-explanation-client-mount) section below.
 
 ```mermaid
 sequenceDiagram
@@ -701,7 +866,73 @@ sequenceDiagram
     participant DC as AD / KDC<br/>10.10.10.8
     participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
 
-    rect rgb(10, 40, 80)
+    rect rgb(144, 176, 216)
+        Note over WIN,DC: Pre-Mount Phase A — Kerberos Authentication (not in capture)
+        WIN->>DC: DNS + AS-REQ/TGS-REQ for cifs/ANF-AU-AA30
+        DC-->>WIN: CIFS service ticket issued
+    end
+
+    rect rgb(150, 221, 193)
+        Note over WIN,ANF: Pre-Mount Phase B — SMB Session Establishment (not in capture)
+        WIN->>ANF: TCP connect + SMB2 Negotiate
+        ANF-->>WIN: Negotiate Response (SMB 3.x)
+        WIN->>ANF: Session Setup (Kerberos) + Tree Connect smb1
+        ANF-->>WIN: Share mounted
+    end
+
+    rect rgb(211, 170, 143)
+        Note over WIN,ANF: Post-Mount Phase 1 — Explorer Initial Probes (frames 1–8)
+        WIN->>ANF: Create Desktop.ini / AutoRun.inf
+        ANF-->>WIN: STATUS_OBJECT_NAME_NOT_FOUND (expected)
+    end
+
+    rect rgb(207, 224, 156)
+        Note over WIN,ANF: Post-Mount Phase 2 — Share Root Listing (frames 9–22)
+        WIN->>ANF: Create + Notify + Find *
+        ANF-->>WIN: 5 entries + STATUS_NO_MORE_FILES
+    end
+
+    rect rgb(154, 200, 215)
+        Note over WIN,ANF: Post-Mount Phase 3 — Capacity Query (frames 23–26)
+        WIN->>ANF: GetInfo FileFsFullSizeInformation ×2
+        ANF-->>WIN: Total / free capacity
+    end
+
+    rect rgb(214, 151, 198)
+        Note over WIN,ANF: Post-Mount Phase 4 — Subfolder Browse + Change Notification (frames 27–49)
+        WIN->>ANF: Create project1 + Find * + Notify
+        ANF-->>WIN: 4 entries + STATUS_PENDING
+        WIN->>ANF: Cancel
+        ANF-->>WIN: STATUS_CANCELLED
+    end
+
+    rect rgb(166, 223, 223)
+        Note over WIN,ANF: Post-Mount Phase 5 — IPC$ / SRVSVC / DFS Check (frames 56–71)
+        WIN->>ANF: Tree Connect IPC$ + FSCTL_DFS_GET_REFERRALS
+        ANF-->>WIN: STATUS_NOT_FOUND (DFS not configured — expected)
+        WIN->>ANF: SRVSVC bind + NetShareGetInfo (smb1)
+        ANF-->>WIN: Share properties returned
+    end
+
+    rect rgb(220, 204, 158)
+        Note over WIN,ANF: Post-Mount Phase 6 — NTFS Object ID Probes (frames 72–87)
+        WIN->>ANF: Create file/folder + FSCTL_CREATE_OR_GET_OBJECT_ID
+        ANF-->>WIN: STATUS_INVALID_DEVICE_REQUEST (expected)
+    end
+```
+
+---
+
+### Phase-by-Phase Explanation (Client Mount)
+
+#### Pre-Mount Phase A — Kerberos Authentication *(not in capture)*
+
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant DC as AD / KDC<br/>10.10.10.8
+
+    rect rgb(144, 176, 216)
         Note over WIN,DC: Pre-Mount Phase A — Kerberos Authentication (not in capture)
         WIN->>DC: DNS A? ANF-AU-AA30.corp.azure
         DC-->>WIN: 10.10.1.10
@@ -712,86 +943,7 @@ sequenceDiagram
         WIN->>DC: TGS-REQ (ticket for cifs/ANF-AU-AA30.corp.azure)
         DC-->>WIN: TGS-REP — CIFS service ticket issued
     end
-
-    rect rgb(10, 60, 40)
-        Note over WIN,ANF: Pre-Mount Phase B — SMB Session Establishment (not in capture)
-        WIN->>ANF: TCP SYN → port 445
-        ANF-->>WIN: TCP SYN-ACK
-        WIN->>ANF: SMB2 Negotiate Request (dialects: 2.0.2, 2.1, 3.0, 3.0.2, 3.1.1)
-        ANF-->>WIN: SMB2 Negotiate Response (selected: SMB 3.x)
-        WIN->>ANF: SMB2 Session Setup Request (Kerberos CIFS ticket)
-        ANF-->>WIN: SMB2 Session Setup Response — session established
-        WIN->>ANF: SMB2 Tree Connect \\10.10.1.10\smb1
-        ANF-->>WIN: Tree Connect Response — share mounted
-    end
-
-    rect rgb(60, 30, 10)
-        Note over WIN,ANF: Post-Mount Phase 1 — Explorer Initial Probes (frames 1–8)
-        WIN->>ANF: Create Request — Desktop.ini
-        ANF-->>WIN: STATUS_OBJECT_NAME_NOT_FOUND
-        WIN->>ANF: Create Request — AutoRun.inf
-        ANF-->>WIN: STATUS_OBJECT_NAME_NOT_FOUND
-        Note over WIN,ANF: Normal — Explorer probes for shell metadata files
-    end
-
-    rect rgb(50, 60, 20)
-        Note over WIN,ANF: Post-Mount Phase 2 — Share Root Listing (frames 9–22)
-        WIN->>ANF: Create Request — share root + Notify Request (change watch)
-        ANF-->>WIN: Create Response + STATUS_PENDING (Notify queued)
-        WIN->>ANF: Find Request SMB2_FIND_ID_BOTH_DIRECTORY_INFO Pattern: *
-        ANF-->>WIN: Find Response — 5 entries returned
-        ANF-->>WIN: STATUS_NO_MORE_FILES
-    end
-
-    rect rgb(20, 50, 60)
-        Note over WIN,ANF: Post-Mount Phase 3 — Capacity Query (frames 23–26)
-        WIN->>ANF: GetInfo Request FS_INFO/FileFsFullSizeInformation
-        ANF-->>WIN: GetInfo Response (total/free sectors)
-        WIN->>ANF: GetInfo Request FS_INFO/FileFsFullSizeInformation
-        ANF-->>WIN: GetInfo Response
-        Note over WIN,ANF: Windows queries capacity twice — once for Explorer, once for shell
-    end
-
-    rect rgb(60, 20, 50)
-        Note over WIN,ANF: Post-Mount Phase 4 — Subfolder Browse + Change Notification (frames 27–49)
-        WIN->>ANF: Create Request — project1 (enumerate subfolder)
-        ANF-->>WIN: Create Response — directory handle
-        WIN->>ANF: Find Request SMB2_FIND_ID_BOTH_DIRECTORY_INFO Pattern: * (project1)
-        ANF-->>WIN: Find Response — 4 entries + STATUS_NO_MORE_FILES
-        WIN->>ANF: Notify Request — watch project1 for changes
-        ANF-->>WIN: STATUS_PENDING (watch registered)
-        WIN->>ANF: Cancel Request (user navigated away)
-        ANF-->>WIN: STATUS_CANCELLED (Notify cancelled)
-    end
-
-    rect rgb(30, 50, 50)
-        Note over WIN,ANF: Post-Mount Phase 5 — IPC$ / SRVSVC / DFS Check (frames 56–71)
-        WIN->>ANF: Tree Connect \\10.10.1.10\IPC$
-        ANF-->>WIN: Tree Connect Response
-        WIN->>ANF: Ioctl FSCTL_DFS_GET_REFERRALS (\10.10.1.10\smb1)
-        ANF-->>WIN: STATUS_NOT_FOUND (DFS not configured — expected)
-        WIN->>ANF: Create srvsvc + DCE/RPC Bind (SRVSVC V3.0)
-        ANF-->>WIN: Bind_ack (Acceptance — 32-bit NDR)
-        WIN->>ANF: NetShareGetInfo request (smb1)
-        ANF-->>WIN: NetShareGetInfo response (share properties)
-        WIN->>ANF: Close srvsvc
-    end
-
-    rect rgb(50, 40, 10)
-        Note over WIN,ANF: Post-Mount Phase 6 — File Access + FSCTL Probes (frames 72–87)
-        WIN->>ANF: Create project1\file.txt.txt + Ioctl FSCTL_CREATE_OR_GET_OBJECT_ID
-        ANF-->>WIN: Create Response OK + STATUS_INVALID_DEVICE_REQUEST
-        Note over WIN,ANF: ANF does not support NTFS Object IDs — expected, not an error
-        WIN->>ANF: Create project1 + Ioctl FSCTL_CREATE_OR_GET_OBJECT_ID
-        ANF-->>WIN: Create Response OK + STATUS_INVALID_DEVICE_REQUEST
-    end
 ```
-
----
-
-### Phase-by-Phase Explanation (Client Mount)
-
-#### Pre-Mount Phase A — Kerberos Authentication *(not in capture)*
 
 Before opening a single SMB packet to the ANF volume, the Windows client must obtain a **Kerberos service ticket** for the ANF SMB server identity.
 
@@ -804,6 +956,24 @@ The service ticket is encrypted with the ANF machine account's key. ANF decrypts
 ---
 
 #### Pre-Mount Phase B — SMB Session Establishment *(not in capture)*
+
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(150, 221, 193)
+        Note over WIN,ANF: Pre-Mount Phase B — SMB Session Establishment (not in capture)
+        WIN->>ANF: TCP SYN → port 445
+        ANF-->>WIN: TCP SYN-ACK
+        WIN->>ANF: SMB2 Negotiate Request (dialects: 2.0.2, 2.1, 3.0, 3.0.2, 3.1.1)
+        ANF-->>WIN: SMB2 Negotiate Response (selected: SMB 3.x)
+        WIN->>ANF: SMB2 Session Setup Request (Kerberos CIFS ticket)
+        ANF-->>WIN: SMB2 Session Setup Response — session established
+        WIN->>ANF: SMB2 Tree Connect \\10.10.1.10\smb1
+        ANF-->>WIN: Tree Connect Response — share mounted
+    end
+```
 
 | Step | SMB Exchange | Outcome |
 |------|-------------|---------|
@@ -821,6 +991,21 @@ Windows keeps SMB sessions alive after the first mount. This capture was started
 
 #### Post-Mount Phase 1 — Explorer Initial Probes (frames 1–8)
 
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(211, 170, 143)
+        Note over WIN,ANF: Post-Mount Phase 1 — Explorer Initial Probes (frames 1–8)
+        WIN->>ANF: Create Request — Desktop.ini
+        ANF-->>WIN: STATUS_OBJECT_NAME_NOT_FOUND
+        WIN->>ANF: Create Request — AutoRun.inf
+        ANF-->>WIN: STATUS_OBJECT_NAME_NOT_FOUND
+        Note over WIN,ANF: Normal — Explorer probes for shell metadata files
+    end
+```
+
 | Frame | File | Result | Purpose |
 |-------|------|--------|---------|
 | 1–3 | `Desktop.ini` | `STATUS_OBJECT_NAME_NOT_FOUND` | Custom folder appearance metadata |
@@ -831,6 +1016,23 @@ Both `NOT_FOUND` responses are **expected and normal**. Windows Explorer sends t
 ---
 
 #### Post-Mount Phase 2 — Share Root Directory Listing (frames 9–22)
+
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(207, 224, 156)
+        Note over WIN,ANF: Post-Mount Phase 2 — Share Root Listing (frames 9–22)
+        WIN->>ANF: Create Request — share root
+        ANF-->>WIN: Create Response
+        WIN->>ANF: Notify Request (change watch)
+        ANF-->>WIN: STATUS_PENDING (watch queued)
+        WIN->>ANF: Find SMB2_FIND_ID_BOTH_DIRECTORY_INFO Pattern: *
+        ANF-->>WIN: Find Response — 5 entries returned
+        ANF-->>WIN: STATUS_NO_MORE_FILES
+    end
+```
 
 Windows issues multiple batched requests in a single TCP segment:
 
@@ -844,6 +1046,21 @@ The `Notify` registration (`STATUS_PENDING`) tells the server to push change not
 
 #### Post-Mount Phase 3 — Capacity Query (frames 23–26)
 
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(154, 200, 215)
+        Note over WIN,ANF: Post-Mount Phase 3 — Capacity Query (frames 23–26)
+        WIN->>ANF: GetInfo FS_INFO/FileFsFullSizeInformation
+        ANF-->>WIN: GetInfo Response (total/free sectors)
+        WIN->>ANF: GetInfo FS_INFO/FileFsFullSizeInformation
+        ANF-->>WIN: GetInfo Response
+        Note over WIN,ANF: Queried twice — Explorer sidebar + status bar
+    end
+```
+
 Two `GetInfo FileFsFullSizeInformation` requests are issued 70ms apart. Windows Explorer reads share capacity:
 - Once for the **drive properties** display (total/free space in Explorer sidebar)
 - Once for the **status bar** at the bottom of the Explorer window
@@ -853,6 +1070,24 @@ ANF responds with `TotalAllocationUnits`, `CallerAvailableAllocationUnits`, `Sec
 ---
 
 #### Post-Mount Phase 4 — Subfolder Browse + Change Notification (frames 27–49)
+
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(214, 151, 198)
+        Note over WIN,ANF: Post-Mount Phase 4 — Subfolder Browse + Change Notification (frames 27–49)
+        WIN->>ANF: Create Request — project1
+        ANF-->>WIN: Create Response — directory handle
+        WIN->>ANF: Find SMB2_FIND_ID_BOTH_DIRECTORY_INFO Pattern: * (project1)
+        ANF-->>WIN: Find Response — 4 entries + STATUS_NO_MORE_FILES
+        WIN->>ANF: Notify Request — watch project1 for changes
+        ANF-->>WIN: STATUS_PENDING (watch registered)
+        WIN->>ANF: Cancel Request (user navigated away)
+        ANF-->>WIN: STATUS_CANCELLED
+    end
+```
 
 When the user clicks into `project1`:
 
@@ -866,6 +1101,25 @@ The Cancel/STATUS_CANCELLED cycle at frames 42–47 is **normal** — it happens
 ---
 
 #### Post-Mount Phase 5 — IPC$ Sub-connection, DFS Check, and SRVSVC (frames 56–71)
+
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(166, 223, 223)
+        Note over WIN,ANF: Post-Mount Phase 5 — IPC$ / SRVSVC / DFS Check (frames 56–71)
+        WIN->>ANF: Tree Connect \\10.10.1.10\IPC$
+        ANF-->>WIN: Tree Connect Response
+        WIN->>ANF: Ioctl FSCTL_DFS_GET_REFERRALS (\10.10.1.10\smb1)
+        ANF-->>WIN: STATUS_NOT_FOUND (DFS not configured — expected)
+        WIN->>ANF: Create srvsvc + DCE/RPC Bind (SRVSVC V3.0)
+        ANF-->>WIN: Bind_ack (Acceptance — 32-bit NDR)
+        WIN->>ANF: NetShareGetInfo request (smb1)
+        ANF-->>WIN: NetShareGetInfo response (share properties)
+        WIN->>ANF: Close srvsvc
+    end
+```
 
 This phase reveals important details about the Windows SMB client's interaction with ANF:
 
@@ -886,6 +1140,25 @@ ANF SMB volumes are not DFS targets by default. The client always probes for DFS
 ---
 
 #### Post-Mount Phase 6 — File Access + FSCTL Object ID Probes (frames 72–87)
+
+```mermaid
+sequenceDiagram
+    participant WIN as Windows 11 Client<br/>10.10.10.9
+    participant ANF as ANF SMB Volume<br/>10.10.1.10 :445
+
+    rect rgb(220, 204, 158)
+        Note over WIN,ANF: Post-Mount Phase 6 — NTFS Object ID Probes (frames 72–87)
+        WIN->>ANF: Create project1\file.txt.txt + FSCTL_CREATE_OR_GET_OBJECT_ID
+        ANF-->>WIN: Create OK + STATUS_INVALID_DEVICE_REQUEST
+        WIN->>ANF: Create project1\file.txt.txt + FSCTL_CREATE_OR_GET_OBJECT_ID
+        ANF-->>WIN: Create OK + STATUS_INVALID_DEVICE_REQUEST
+        WIN->>ANF: Create project1 (folder) + FSCTL_CREATE_OR_GET_OBJECT_ID
+        ANF-->>WIN: Create OK + STATUS_INVALID_DEVICE_REQUEST
+        WIN->>ANF: Create project1 (folder) + FSCTL_CREATE_OR_GET_OBJECT_ID
+        ANF-->>WIN: Create OK + STATUS_INVALID_DEVICE_REQUEST
+        Note over WIN,ANF: ANF does not support NTFS Object IDs — expected, not an error
+    end
+```
 
 When the client tries to open a file or folder, Windows automatically issues `FSCTL_CREATE_OR_GET_OBJECT_ID` alongside the Create request:
 
